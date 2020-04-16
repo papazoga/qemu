@@ -1151,6 +1151,94 @@ static void vfio_probe_rtl8168_bar2_quirk(VFIOPCIDevice *vdev, int nr)
     trace_vfio_quirk_rtl8168_probe(vdev->vbasedev.name);
 }
 
+/*
+ * National Instruments MITE PCI chip
+ */
+typedef struct VFIOnimiteQuirk {
+    VFIOPCIDevice *vdev;
+    uint32_t bar1_host;
+} VFIOnimiteQuirk;
+
+static uint64_t vfio_nimite_quirk_read(void *opaque,
+				       hwaddr addr, unsigned size)
+{
+    VFIOnimiteQuirk *nimite = opaque;
+    VFIOPCIDevice *vdev = nimite->vdev;
+    PCIDevice *pdev = &vdev->pdev;
+    uint64_t bar1_guest = pdev->io_regions[1].addr;
+    uint64_t data = vfio_region_read(&vdev->bars[0].region, addr + 0xc0, size);
+
+    data = bar1_guest | (data & 0xff);
+    trace_vfio_nimite_quirk_read(data);
+
+    return data;
+}
+
+static void vfio_nimite_quirk_write(void *opaque, hwaddr addr,
+				    uint64_t data, unsigned size)
+{
+    VFIOnimiteQuirk *nimite = opaque;
+    VFIOPCIDevice *vdev = nimite->vdev;
+
+    data = nimite->bar1_host | (data & 0xff);
+    trace_vfio_nimite_quirk_write(data);
+
+    vfio_region_write(&vdev->bars[0].region, addr + 0xc0, data, size);
+}
+
+
+static const MemoryRegionOps vfio_nimite_iodwbsr_quirk = {
+    .read = vfio_nimite_quirk_read,
+    .write = vfio_nimite_quirk_write,
+    .valid = {
+        .min_access_size = 4,
+        .max_access_size = 4,
+        .unaligned = false,
+    },
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
+#define PCI_VENDOR_ID_NI 0x1093
+
+static void vfio_probe_nimite_bar0_quirk(VFIOPCIDevice *vdev, int nr)
+{
+    VFIOQuirk *quirk;
+    VFIOnimiteQuirk *mite;
+    int ret;
+
+    /*
+     * This currently only applies to the PCI-6036E, but
+     * it should work for many of the MITE-powered PCI cards.
+     */
+    if (!vfio_pci_is(vdev, PCI_VENDOR_ID_NI, 0x2890) || nr != 0) {
+	return;
+    }
+
+    quirk = vfio_quirk_alloc(1);
+    quirk->data = mite = g_malloc0(sizeof(*mite));
+
+    mite->vdev = vdev;
+
+    ret = pread(vdev->vbasedev.fd, &mite->bar1_host, sizeof(mite->bar1_host),
+		vdev->config_offset + PCI_BASE_ADDRESS_1);
+
+    if (ret < sizeof(mite->bar1_host)) {
+	warn_report("unable to pread the host BAR1");
+    }
+
+    memory_region_init_io(&quirk->mem[0], OBJECT(vdev),
+			  &vfio_nimite_iodwbsr_quirk, mite,
+			  "vfio-nimite-iodwbsr-quirk", 8);
+
+    memory_region_add_subregion_overlap(vdev->bars[nr].region.mem,
+					0xc0, &quirk->mem[0], 1);
+
+    QLIST_INSERT_HEAD(&vdev->bars[nr].quirks, quirk, next);
+
+    trace_vfio_quirk_nimite_probe(vdev->vbasedev.name);
+}
+
+
 #define IGD_ASLS 0xfc /* ASL Storage Register */
 
 /*
@@ -1250,6 +1338,7 @@ void vfio_bar_quirk_setup(VFIOPCIDevice *vdev, int nr)
     vfio_probe_nvidia_bar5_quirk(vdev, nr);
     vfio_probe_nvidia_bar0_quirk(vdev, nr);
     vfio_probe_rtl8168_bar2_quirk(vdev, nr);
+    vfio_probe_nimite_bar0_quirk(vdev, nr);
 #ifdef CONFIG_VFIO_IGD
     vfio_probe_igd_bar4_quirk(vdev, nr);
 #endif
